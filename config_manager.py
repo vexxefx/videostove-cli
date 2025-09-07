@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import datetime
 from videostove_core import DEFAULT_CONFIG
+from asset_cache import AssetCache
 
 class ConfigManager:
     """Manage VideoStove configurations and presets"""
@@ -17,6 +18,7 @@ class ConfigManager:
         
         self.presets_file = os.path.join(self.config_dir, "presets.json")
         self.settings_file = os.path.join(self.config_dir, "settings.json")
+        self.asset_cache = AssetCache()
     
     def list_presets(self):
         """List available presets"""
@@ -257,6 +259,113 @@ class ConfigManager:
             print(f"Error loading config from file: {e}")
             return DEFAULT_CONFIG.copy()
     
+    def apply_global_assets(self, config, assets):
+        """Merge asset paths into configuration"""
+        if not assets:
+            return config
+        
+        asset_config = config.copy()
+        
+        # Apply assets to relevant config settings
+        if 'fonts' in assets:
+            asset_config['custom_font_path'] = assets['fonts']
+            asset_config['font_family'] = assets['fonts']  # Override with custom font
+        
+        if 'overlays' in assets:
+            asset_config['global_overlay_path'] = assets['overlays']
+            asset_config['use_overlay'] = True  # Enable overlay usage
+        
+        if 'bgmusic' in assets:
+            asset_config['global_bg_music_path'] = assets['bgmusic']
+            asset_config['use_bg_music'] = True  # Enable background music
+        
+        return asset_config
+    
+    def validate_asset_paths(self, assets):
+        """Verify asset file accessibility"""
+        validated_assets = {}
+        
+        for asset_type, asset_path in assets.items():
+            if asset_path and os.path.exists(asset_path):
+                # Additional validation by asset type
+                if self._is_valid_asset_by_type(asset_path, asset_type):
+                    validated_assets[asset_type] = asset_path
+                else:
+                    print(f"Warning: Invalid {asset_type} asset: {asset_path}")
+            else:
+                print(f"Warning: Asset not found: {asset_path}")
+        
+        return validated_assets
+    
+    def _is_valid_asset_by_type(self, filepath, asset_type):
+        """Validate asset file by type"""
+        filename_lower = os.path.basename(filepath).lower()
+        
+        if asset_type == 'fonts':
+            return filename_lower.endswith(('.ttf', '.otf', '.woff', '.woff2'))
+        elif asset_type == 'overlays':
+            return filename_lower.endswith(('.mp4', '.mov', '.avi', '.webm', '.mkv'))
+        elif asset_type == 'bgmusic':
+            return filename_lower.endswith(('.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg'))
+        
+        return False
+    
+    def get_asset_defaults(self):
+        """Provide fallback asset configurations"""
+        return {
+            'fonts': None,  # System default font
+            'overlays': None,  # No overlay
+            'bgmusic': None  # No background music
+        }
+    
+    def get_cached_presets(self):
+        """List available cached presets"""
+        cached_assets = self.asset_cache.get_cached_assets()
+        presets = cached_assets.get('presets', [])
+        
+        preset_list = []
+        for preset_info in presets:
+            preset_list.append({
+                'name': preset_info['name'].replace('.json', ''),
+                'path': preset_info['path'],
+                'size': preset_info.get('size', 0),
+                'cached': True
+            })
+        
+        return preset_list
+    
+    def load_cached_preset(self, name):
+        """Load a cached preset by name"""
+        cached_presets = self.get_cached_presets()
+        
+        for preset in cached_presets:
+            if preset['name'].lower() == name.lower():
+                try:
+                    with open(preset['path'], 'r', encoding='utf-8') as f:
+                        return json.load(f)
+                except Exception as e:
+                    print(f"Error loading cached preset '{name}': {e}")
+                    return None
+        
+        print(f"Cached preset '{name}' not found")
+        return None
+    
+    def validate_cached_assets(self):
+        """Verify cached asset integrity"""
+        return self.asset_cache.validate_cache_integrity()
+    
+    def clear_asset_cache(self, asset_type=None):
+        """Clean up cached assets"""
+        self.asset_cache.clear_cache(asset_type)
+    
+    def get_cache_status(self):
+        """Get comprehensive cache status"""
+        return self.asset_cache.get_cache_status()
+    
+    def cleanup_old_cache(self, days_old=30):
+        """Clean up old cache entries"""
+        self.asset_cache.cleanup_old_cache(days_old)
+    
     def create_sample_configs(self):
         """Create sample configuration files"""
         configs_dir = os.path.join(self.config_dir, "configs")
@@ -358,6 +467,25 @@ def main():
     # Create samples
     subparsers.add_parser('create-samples', help='Create sample configuration files')
     
+    # Asset commands
+    asset_parser = subparsers.add_parser('validate-assets', help='Validate asset files')
+    asset_parser.add_argument('--fonts', help='Font file path')
+    asset_parser.add_argument('--overlays', help='Overlay video file path')
+    asset_parser.add_argument('--bgmusic', help='Background music file path')
+    
+    # Cache commands
+    subparsers.add_parser('cache-status', help='Show asset cache status')
+    
+    cache_clear_parser = subparsers.add_parser('cache-clear', help='Clear asset cache')
+    cache_clear_parser.add_argument('--type', help='Asset type to clear (all if not specified)')
+    
+    subparsers.add_parser('cache-validate', help='Validate cache integrity')
+    
+    cache_cleanup_parser = subparsers.add_parser('cache-cleanup', help='Clean up old cache entries')
+    cache_cleanup_parser.add_argument('--days', type=int, default=30, help='Remove entries older than N days')
+    
+    subparsers.add_parser('list-cached-presets', help='List cached presets')
+    
     args = parser.parse_args()
     
     if not args.command:
@@ -397,6 +525,64 @@ def main():
     elif args.command == 'create-samples':
         configs_dir = config_mgr.create_sample_configs()
         print(f"Sample configurations created in: {configs_dir}")
+    
+    elif args.command == 'validate-assets':
+        assets = {}
+        if args.fonts:
+            assets['fonts'] = args.fonts
+        if args.overlays:
+            assets['overlays'] = args.overlays
+        if args.bgmusic:
+            assets['bgmusic'] = args.bgmusic
+        
+        if assets:
+            validated = config_mgr.validate_asset_paths(assets)
+            print(f"Validated {len(validated)} out of {len(assets)} assets:")
+            for asset_type, path in validated.items():
+                print(f"  ✅ {asset_type}: {path}")
+        else:
+            print("No assets specified for validation")
+    
+    elif args.command == 'cache-status':
+        status = config_mgr.get_cache_status()
+        print("Asset Cache Status")
+        print("=" * 50)
+        print(f"Cache exists: {status['cache_exists']}")
+        print(f"Assets cached: {status['assets_cached']}")
+        print(f"Total assets: {status['total_assets']}")
+        print(f"Cache size: {status['cache_size_bytes'] / 1024 / 1024:.1f} MB")
+        print(f"Last updated: {status['last_updated'] or 'Never'}")
+        print(f"Asset breakdown: {status['asset_breakdown']}")
+    
+    elif args.command == 'cache-clear':
+        config_mgr.clear_asset_cache(args.type)
+    
+    elif args.command == 'cache-validate':
+        validation = config_mgr.validate_cached_assets()
+        print("Cache Validation Results")
+        print("=" * 50)
+        print(f"Valid: {validation['valid']}")
+        print(f"Assets checked: {validation['assets_checked']}")
+        if validation['issues']:
+            print("Issues found:")
+            for issue in validation['issues']:
+                print(f"  - {issue}")
+    
+    elif args.command == 'cache-cleanup':
+        config_mgr.cleanup_old_cache(args.days)
+    
+    elif args.command == 'list-cached-presets':
+        presets = config_mgr.get_cached_presets()
+        if presets:
+            print("Cached Presets:")
+            print("=" * 50)
+            for preset in presets:
+                print(f"📋 {preset['name']}")
+                print(f"   Path: {preset['path']}")
+                print(f"   Size: {preset['size'] / 1024:.1f} KB")
+                print()
+        else:
+            print("No cached presets found")
 
 if __name__ == "__main__":
     main()

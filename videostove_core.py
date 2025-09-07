@@ -585,9 +585,10 @@ def run_gpu_optimized_ffmpeg(self, cmd_args, description):
 # ===================================================================
 
 class VideoCreator:
-    def __init__(self, update_callback=None):
+    def __init__(self, update_callback=None, global_assets=None):
         self.update_callback = update_callback or print
         self.gpu_options = detect_gpu_acceleration()
+        self.global_assets = global_assets or {}
         
     def log(self, message):
         """Thread-safe logging"""
@@ -915,6 +916,11 @@ class VideoCreator:
     
     def apply_overlay(self, master_video, overlay_video, output_path, duration):
         """Apply overlay with simple or screen blend mode."""
+        # Use global overlay if none provided
+        if not overlay_video and self.global_assets.get('overlays'):
+            overlay_video = self.global_assets['overlays']
+            self.log(f"Using global overlay: {os.path.basename(overlay_video)}")
+        
         if not overlay_video or not os.path.exists(overlay_video):
             shutil.copy2(master_video, output_path)
             return True
@@ -1060,6 +1066,15 @@ class VideoCreator:
         """Create slideshow with mode-specific optimizations."""
         self.log("🚀 STARTING VIDEO CREATION")
         self.log("=" * 60)
+        
+        # Apply global assets if none provided (cached or live paths)
+        if not bg_music and self.global_assets.get('bgmusic'):
+            bg_music = self.global_assets['bgmusic']
+            self.log(f"Using global background music: {os.path.basename(bg_music)} [cached]")
+        
+        if not overlay_video and self.global_assets.get('overlays'):
+            overlay_video = self.global_assets['overlays']
+            self.log(f"Using global overlay: {os.path.basename(overlay_video)} [cached]")
         
         project_type = CONFIG.get("project_type", "montage")
         self.log(f"📍 Mode: {project_type.upper()}")
@@ -1690,7 +1705,7 @@ class VideoCreator:
 # ===================================================================
 
 class AutoCaptioner:
-    def __init__(self, model_size="tiny", update_callback=None):
+    def __init__(self, model_size="tiny", update_callback=None, global_assets=None):
         self.update_callback = update_callback or print
         self.model = None
         self.model_size = model_size
@@ -1698,6 +1713,7 @@ class AutoCaptioner:
         self.gpu_options = detect_gpu_acceleration()
         self.engine_type = None  # Will be 'openai' or 'faster'
         self.faster_whisper_available = None  # Cache availability check
+        self.global_assets = global_assets or {}
         
     def log(self, message):
         if self.update_callback:
@@ -2382,6 +2398,16 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         outline_color = CONFIG.get("outline_color", "#000000")
         outline_width = CONFIG.get("outline_width", 2)
         
+        # Use global font asset if available (cached or live path)
+        custom_font_path = None
+        if self.global_assets.get('fonts'):
+            custom_font_path = self.global_assets['fonts']
+            self.log(f"Using custom font: {os.path.basename(custom_font_path)} [cached]")
+            # Validate font file exists and is accessible
+            if not os.path.exists(custom_font_path):
+                self.log(f"⚠️ Custom font not found at {custom_font_path}, falling back to system font")
+                custom_font_path = None
+        
         # Position settings
         vertical_position = CONFIG.get("vertical_position", "bottom")
         horizontal_position = CONFIG.get("horizontal_position", "center")
@@ -2416,8 +2442,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             else:  # center
                 alignment = 2
             
+            # Use custom font path if available
+            font_setting = custom_font_path if custom_font_path else font_family
+            
             style_overrides = (
-                f"force_style='FontName={font_family},"
+                f"force_style='FontName={font_setting},"
                 f"FontSize={font_size},"
                 f"Bold={1 if font_weight == 'bold' else 0},"
                 f"PrimaryColour=&H{text_rgb[2]:02x}{text_rgb[1]:02x}{text_rgb[0]:02x},"

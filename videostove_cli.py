@@ -186,13 +186,22 @@ class CLIVideoStove:
         else:
             return "slideshow"
     
-    def process_single_project(self, project_folder, output_file, config_file=None):
+    def process_single_project(self, project_folder, output_file, config_file=None, assets=None):
         """Process a single project folder"""
         self.log(f"Processing single project: {project_folder}", force=True)
         
         # Load config if provided
         if config_file:
             self.load_config(config_file)
+        
+        # Validate assets if provided
+        validated_assets = {}
+        if assets:
+            from config_manager import ConfigManager
+            config_mgr = ConfigManager()
+            validated_assets = config_mgr.validate_asset_paths(assets)
+            if validated_assets:
+                self.log(f"Using assets: {', '.join(validated_assets.keys())}", force=True)
         
         # Analyze project
         project_name = os.path.basename(project_folder)
@@ -207,7 +216,7 @@ class CLIVideoStove:
         
         # Import and use VideoCreator
         from videostove_core import VideoCreator
-        creator = VideoCreator(update_callback=self.log)
+        creator = VideoCreator(update_callback=self.log, global_assets=validated_assets)
         
         # Process project
         success = creator.create_slideshow(
@@ -226,7 +235,7 @@ class CLIVideoStove:
         
         return success
     
-    def process_batch(self, source_folder, output_folder, config_file=None):
+    def process_batch(self, source_folder, output_folder, config_file=None, assets=None):
         """Process multiple projects in batch"""
         self.log(f"Starting batch processing", force=True)
         self.log(f"Source: {source_folder}", force=True)
@@ -235,6 +244,15 @@ class CLIVideoStove:
         # Load config if provided
         if config_file:
             self.load_config(config_file)
+        
+        # Validate assets if provided
+        validated_assets = {}
+        if assets:
+            from config_manager import ConfigManager
+            config_mgr = ConfigManager()
+            validated_assets = config_mgr.validate_asset_paths(assets)
+            if validated_assets:
+                self.log(f"Using assets: {', '.join(validated_assets.keys())}", force=True)
         
         # Scan for projects
         projects = self.scan_directory_for_projects(source_folder)
@@ -253,7 +271,7 @@ class CLIVideoStove:
         failed = 0
         
         from videostove_core import VideoCreator
-        creator = VideoCreator(update_callback=self.log)
+        creator = VideoCreator(update_callback=self.log, global_assets=validated_assets)
         
         for i, project in enumerate(projects, 1):
             self.log(f"\nProcessing {i}/{len(projects)}: {project['name']}", force=True)
@@ -286,6 +304,47 @@ class CLIVideoStove:
         
         return successful > 0
 
+def handle_cache_command(args):
+    """Handle cache management commands"""
+    from asset_cache import AssetCache
+    
+    if not args.cache_command:
+        print("Cache command required. Use --help for options.")
+        return 1
+    
+    cache = AssetCache()
+    
+    if args.cache_command == 'status':
+        status = cache.get_cache_status()
+        print("Asset Cache Status")
+        print("=" * 50)
+        print(f"Cache exists: {status['cache_exists']}")
+        print(f"Assets cached: {status['assets_cached']}")
+        print(f"Total assets: {status['total_assets']}")
+        print(f"Cache size: {status['cache_size_bytes'] / 1024 / 1024:.1f} MB")
+        print(f"Last updated: {status['last_updated'] or 'Never'}")
+        print(f"Asset breakdown: {status['asset_breakdown']}")
+        
+    elif args.cache_command == 'clear':
+        cache.clear_cache()
+        
+    elif args.cache_command == 'validate':
+        validation = cache.validate_cache_integrity()
+        print("Cache Validation Results")
+        print("=" * 50)
+        print(f"Valid: {validation['valid']}")
+        print(f"Assets checked: {validation['assets_checked']}")
+        if validation['issues']:
+            print("Issues found:")
+            for issue in validation['issues']:
+                print(f"  - {issue}")
+        
+    elif args.cache_command == 'cleanup':
+        days = getattr(args, 'days', 30)
+        cache.cleanup_old_cache(days)
+    
+    return 0
+
 def create_argument_parser():
     """Create command line argument parser"""
     parser = argparse.ArgumentParser(
@@ -302,6 +361,13 @@ Examples:
   # With custom config
   python videostove_cli.py single /path/to/project output.mp4 --config my_preset.json
   
+  # With custom assets
+  python videostove_cli.py batch /path/to/projects /path/to/outputs --font custom.ttf --overlay effect.mp4 --bg-music music.mp3
+  
+  # Cache management
+  python videostove_cli.py cache status
+  python videostove_cli.py cache clear
+  
   # Verbose output
   python videostove_cli.py batch /path/to/projects /path/to/outputs --verbose
         """
@@ -315,12 +381,29 @@ Examples:
     single_parser.add_argument('project_folder', help='Path to project folder')
     single_parser.add_argument('output_file', help='Output video file path')
     single_parser.add_argument('--config', help='Configuration JSON file')
+    single_parser.add_argument('--font', help='Custom font file path')
+    single_parser.add_argument('--overlay', help='Overlay video file path')
+    single_parser.add_argument('--bg-music', help='Background music file path')
     
     # Batch processing command
     batch_parser = subparsers.add_parser('batch', help='Process multiple projects')
     batch_parser.add_argument('source_folder', help='Folder containing project folders')
     batch_parser.add_argument('output_folder', help='Output folder for processed videos')
     batch_parser.add_argument('--config', help='Configuration JSON file')
+    batch_parser.add_argument('--font', help='Custom font file path')
+    batch_parser.add_argument('--overlay', help='Overlay video file path')
+    batch_parser.add_argument('--bg-music', help='Background music file path')
+    
+    # Cache management commands
+    cache_parser = subparsers.add_parser('cache', help='Asset cache management')
+    cache_subparsers = cache_parser.add_subparsers(dest='cache_command', help='Cache commands')
+    
+    cache_subparsers.add_parser('status', help='Show cache status')
+    cache_subparsers.add_parser('clear', help='Clear all cache')
+    cache_subparsers.add_parser('validate', help='Validate cache integrity')
+    
+    cleanup_parser = cache_subparsers.add_parser('cleanup', help='Clean old cache entries')
+    cleanup_parser.add_argument('--days', type=int, default=30, help='Remove entries older than N days')
     
     # Global options
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
@@ -337,21 +420,36 @@ def main():
         parser.print_help()
         return 1
     
-    # Initialize CLI processor
-    cli = CLIVideoStove(config_file=args.config, verbose=args.verbose)
-    
     try:
+        # Handle cache commands early (they don't need CLI processor)
+        if args.command == 'cache':
+            return handle_cache_command(args)
+        
+        # Initialize CLI processor for other commands
+        cli = CLIVideoStove(config_file=getattr(args, 'config', None), verbose=args.verbose)
+        
+        # Parse asset arguments
+        assets = {}
+        if hasattr(args, 'font') and args.font:
+            assets['fonts'] = args.font
+        if hasattr(args, 'overlay') and args.overlay:
+            assets['overlays'] = args.overlay  
+        if hasattr(args, 'bg_music') and args.bg_music:
+            assets['bgmusic'] = args.bg_music
+        
         if args.command == 'single':
             success = cli.process_single_project(
                 args.project_folder, 
                 args.output_file, 
-                args.config
+                args.config,
+                assets if assets else None
             )
         elif args.command == 'batch':
             success = cli.process_batch(
                 args.source_folder, 
                 args.output_folder, 
-                args.config
+                args.config,
+                assets if assets else None
             )
         else:
             parser.print_help()

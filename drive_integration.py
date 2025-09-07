@@ -12,6 +12,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 import datetime
+from asset_cache import AssetCache
 
 class DriveVideoStove:
     """Google Drive integrated VideoStove processor"""
@@ -21,6 +22,10 @@ class DriveVideoStove:
         self.work_dir = None
         self.downloaded_presets = []
         self.discovered_projects = []
+        self.available_assets = {}
+        self.selected_assets = {}
+        self.asset_cache = AssetCache()
+        self.assets_folder_id = None
         
     def _authenticate(self, credentials_path):
         """Authenticate with Google Drive API"""
@@ -51,14 +56,18 @@ class DriveVideoStove:
         return build('drive', 'v3', credentials=creds)
     
     def setup_workspace(self):
-        """Create temporary workspace for processing"""
+        """Create temporary workspace for processing (projects only, assets are cached)"""
         self.work_dir = tempfile.mkdtemp(prefix='videostove_drive_')
         print(f"Created workspace: {self.work_dir}")
         
-        # Create subdirectories
+        # Create subdirectories (no assets - they are cached persistently)
         os.makedirs(os.path.join(self.work_dir, 'projects'), exist_ok=True)
-        os.makedirs(os.path.join(self.work_dir, 'presets'), exist_ok=True)
         os.makedirs(os.path.join(self.work_dir, 'outputs'), exist_ok=True)
+        
+        # Display cache status
+        cache_status = self.asset_cache.get_cache_status()
+        if cache_status['assets_cached']:
+            print(f"🗄️ Asset cache available: {cache_status['total_assets']} assets ({cache_status['cache_size_bytes'] / 1024 / 1024:.1f} MB)")
         
         return self.work_dir
     
@@ -79,11 +88,16 @@ class DriveVideoStove:
             presets = []
             other_files = []
             
+            assets_folder = None
             for file in files:
                 if file['mimeType'] == 'application/vnd.google-apps.folder':
                     # Check if it's a project folder
                     if self._is_project_folder(file['id']):
                         projects.append(file)
+                    # Check if it's assets folder (store for smart caching)
+                    elif file['name'].lower() in ['assets', 'asset']:
+                        assets_folder = file
+                        self.assets_folder_id = file['id']
                 elif file['name'].endswith('.json'):
                     # Check if it's a preset file
                     if self._is_preset_file(file['id']):
@@ -91,12 +105,19 @@ class DriveVideoStove:
                 else:
                     other_files.append(file)
             
+            # Handle assets separately through cache system
+            assets_info = {}
+            if assets_folder:
+                print(f"📁 Assets folder found: {assets_folder['name']}")
+                # Note: Assets will be handled through smart sync, not immediate scan
+            
             print(f"Found: {len(projects)} projects, {len(presets)} presets, {len(other_files)} other files")
             
             return {
                 'projects': projects,
                 'presets': presets,
-                'other_files': other_files
+                'other_files': other_files,
+                'assets': assets_info
             }
             
         except Exception as e:
@@ -143,6 +164,248 @@ class DriveVideoStove:
             
         except Exception:
             return False
+    
+    def scan_assets_folder(self, assets_folder_id):
+        """Scan assets folder and categorize available assets"""
+        print(f"Scanning assets folder: {assets_folder_id}")
+        
+        try:
+            assets_info = {
+                'fonts': [],
+                'overlays': [],
+                'bgmusic': []
+            }
+            
+            # Get subfolder contents
+            fonts = self._get_subfolder_contents(assets_folder_id, 'fonts')
+            overlays = self._get_subfolder_contents(assets_folder_id, 'overlays')
+            bgmusic = self._get_subfolder_contents(assets_folder_id, 'bgmusic')
+            
+            assets_info['fonts'] = fonts
+            assets_info['overlays'] = overlays
+            assets_info['bgmusic'] = bgmusic
+            
+            total_assets = len(fonts) + len(overlays) + len(bgmusic)
+            print(f"Found assets: {len(fonts)} fonts, {len(overlays)} overlays, {len(bgmusic)} bgmusic files")
+            
+            self.available_assets = assets_info
+            return assets_info
+            
+        except Exception as e:
+            print(f"Error scanning assets folder: {e}")
+            return {}
+    
+    def _get_subfolder_contents(self, assets_folder_id, subfolder_name):
+        """Get contents of a specific asset subfolder"""
+        try:
+            # Find subfolder
+            results = self.service.files().list(
+                q=f"'{assets_folder_id}' in parents and name='{subfolder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false",
+                fields="files(id, name)"
+            ).execute()
+            
+            subfolders = results.get('files', [])
+            if not subfolders:
+                return []
+            
+            subfolder_id = subfolders[0]['id']
+            
+            # Get files in subfolder
+            results = self.service.files().list(
+                q=f"'{subfolder_id}' in parents and trashed=false",
+                fields="files(id, name, mimeType, size)"
+            ).execute()
+            
+            files = results.get('files', [])
+            
+            # Filter by asset type
+            valid_files = []
+            for file in files:
+                if file['mimeType'] != 'application/vnd.google-apps.folder':
+                    if self._is_valid_asset_file(file['name'], subfolder_name):
+                        file['subfolder'] = subfolder_name
+                        valid_files.append(file)
+            
+            return valid_files
+            
+        except Exception as e:
+            print(f"Error getting {subfolder_name} contents: {e}")
+            return []
+    
+    def _is_valid_asset_file(self, filename, asset_type):
+        """Check if file is a valid asset for the given type"""
+        filename_lower = filename.lower()
+        
+        if asset_type == 'fonts':
+            return filename_lower.endswith(('.ttf', '.otf', '.woff', '.woff2'))
+        elif asset_type == 'overlays':
+            return filename_lower.endswith(('.mp4', '.mov', '.avi', '.webm', '.mkv'))
+        elif asset_type == 'bgmusic':
+            return filename_lower.endswith(('.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg'))
+        
+        return False
+    
+    def download_selected_assets(self, assets_selection):
+        """Download only the selected assets to local workspace"""
+        if not assets_selection:
+            return {}
+        
+        print("Downloading selected assets...")
+        assets_dir = os.path.join(self.work_dir, 'assets')
+        downloaded_assets = {}
+        
+        for asset_type, selected_file in assets_selection.items():
+            if selected_file and selected_file != 'skip':
+                try:
+                    # Create type-specific directory
+                    type_dir = os.path.join(assets_dir, asset_type)
+                    os.makedirs(type_dir, exist_ok=True)
+                    
+                    # Download the file
+                    local_path = os.path.join(type_dir, selected_file['name'])
+                    self._download_asset_file(selected_file, local_path)
+                    
+                    downloaded_assets[asset_type] = local_path
+                    print(f"  Downloaded {asset_type}: {selected_file['name']}")
+                    
+                except Exception as e:
+                    print(f"  Error downloading {asset_type} asset: {e}")
+        
+        self.selected_assets = downloaded_assets
+        return downloaded_assets
+    
+    def _download_asset_file(self, file_info, local_path):
+        """Download individual asset file"""
+        request = self.service.files().get_media(fileId=file_info['id'])
+        
+        with open(local_path, 'wb') as f:
+            downloader = MediaIoBaseDownload(f, request)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+    
+    def check_assets_cache(self, folder_id=None):
+        """Compare local cache timestamp vs Drive assets folder"""
+        if not folder_id:
+            folder_id = self.assets_folder_id
+        
+        if not folder_id:
+            return {'cache_valid': False, 'reason': 'No assets folder found'}
+        
+        try:
+            # Get Drive folder modification time
+            drive_modified_time = self._get_folder_modified_time(folder_id)
+            
+            # Check cache validity
+            cache_valid = self.asset_cache.is_cache_valid(folder_id, drive_modified_time)
+            
+            return {
+                'cache_valid': cache_valid,
+                'drive_modified': drive_modified_time,
+                'folder_id': folder_id,
+                'cache_status': self.asset_cache.get_cache_status(folder_id)
+            }
+        except Exception as e:
+            print(f"Error checking asset cache: {e}")
+            return {'cache_valid': False, 'reason': f'Cache check failed: {e}'}
+    
+    def _get_folder_modified_time(self, folder_id):
+        """Get Drive folder last modified timestamp"""
+        try:
+            file_info = self.service.files().get(
+                fileId=folder_id,
+                fields='modifiedTime'
+            ).execute()
+            
+            return file_info.get('modifiedTime')
+        except Exception as e:
+            print(f"Error getting folder modified time: {e}")
+            return None
+    
+    def sync_assets_folder(self, folder_id=None, force_update=False):
+        """Download assets only if needed (smart sync)"""
+        if not folder_id:
+            folder_id = self.assets_folder_id
+        
+        if not folder_id:
+            print("No assets folder to sync")
+            return {}
+        
+        print("🔄 Checking asset cache...")
+        
+        # Check if cache is valid
+        cache_check = self.check_assets_cache(folder_id)
+        
+        if not force_update and cache_check.get('cache_valid'):
+            print("✅ Asset cache is current, using cached assets")
+            return self.get_cached_assets()
+        
+        print("📥 Downloading assets from Drive...")
+        
+        try:
+            # Get fresh asset information from Drive
+            assets_info = self.scan_assets_folder(folder_id)
+            
+            # Download and cache assets
+            cached_assets = {}
+            for asset_type, files in assets_info.items():
+                cached_assets[asset_type] = []
+                for file_info in files:
+                    cached_path = self._download_and_cache_asset(file_info, asset_type)
+                    if cached_path:
+                        cached_assets[asset_type].append({
+                            'name': file_info['name'],
+                            'path': cached_path,
+                            'size': file_info.get('size', 0),
+                            'cached': True,
+                            'drive_info': file_info
+                        })
+            
+            # Update cache metadata
+            drive_modified_time = self._get_folder_modified_time(folder_id)
+            self.asset_cache.update_folder_cache_info(
+                folder_id, 
+                drive_modified_time, 
+                [f"{k}/{f['name']}" for k, v in assets_info.items() for f in v]
+            )
+            
+            print(f"✅ Assets cached: {sum(len(v) for v in cached_assets.values())} files")
+            self.available_assets = cached_assets
+            return cached_assets
+            
+        except Exception as e:
+            print(f"Error syncing assets: {e}")
+            # Fallback to cached assets if available
+            cached_assets = self.get_cached_assets()
+            if cached_assets:
+                print("⚠️ Using cached assets due to sync error")
+                return cached_assets
+            return {}
+    
+    def _download_and_cache_asset(self, file_info, asset_type):
+        """Download asset file and store in cache"""
+        try:
+            # Download file content
+            request = self.service.files().get_media(fileId=file_info['id'])
+            content = request.execute()
+            
+            # Save to cache
+            cached_path = self.asset_cache.save_asset(
+                asset_type, 
+                file_info['name'], 
+                content, 
+                file_info
+            )
+            
+            return cached_path
+            
+        except Exception as e:
+            print(f"Error caching asset {file_info['name']}: {e}")
+            return None
+    
+    def get_cached_assets(self):
+        """Load assets from cache"""
+        return self.asset_cache.get_cached_assets(self.assets_folder_id)
     
     def download_presets(self, preset_files):
         """Download and analyze preset files"""
@@ -381,7 +644,7 @@ class DriveVideoStove:
             print(f"Error loading preset config: {e}")
             return {}
     
-    def batch_process_projects(self, config, output_folder_id):
+    def batch_process_projects(self, config, output_folder_id, selected_assets=None):
         """Process all downloaded projects using selected configuration"""
         if not self.discovered_projects:
             print("No projects to process")
@@ -397,7 +660,7 @@ class DriveVideoStove:
             # Update global config
             CONFIG.update(config)
             
-            creator = VideoCreator(update_callback=print)
+            creator = VideoCreator(update_callback=print, global_assets=selected_assets)
             
             for i, project in enumerate(self.discovered_projects, 1):
                 print(f"\nProcessing project {i}/{len(self.discovered_projects)}: {project['name']}")
@@ -455,11 +718,16 @@ class DriveVideoStove:
         except Exception as e:
             print(f"Upload failed for {project_name}: {e}")
     
-    def cleanup(self):
-        """Clean up temporary workspace"""
+    def cleanup(self, preserve_cache=True):
+        """Clean up temporary workspace (preserve asset cache by default)"""
         if self.work_dir and os.path.exists(self.work_dir):
             shutil.rmtree(self.work_dir)
             print(f"Cleaned up workspace: {self.work_dir}")
+        
+        if preserve_cache:
+            cache_status = self.asset_cache.get_cache_status()
+            if cache_status['assets_cached']:
+                print(f"🗄️ Asset cache preserved: {cache_status['total_assets']} assets")
 
 # Main workflow function
 def main_drive_workflow():
@@ -514,8 +782,28 @@ def main_drive_workflow():
         config = drive_processor.load_preset_config(selected_preset)
         print(f"Loaded configuration: {len(config)} settings")
         
+        # Download and select assets if available
+        selected_assets = {}
+        if scan_results.get('assets'):
+            print("\nAssets found in Drive folder!")
+            assets_info = scan_results['assets']
+            if any(len(assets_info[key]) > 0 for key in assets_info):
+                # Simple asset selection (could be enhanced)
+                print("Available assets:")
+                for asset_type, files in assets_info.items():
+                    if files:
+                        print(f"  {asset_type}: {len(files)} files")
+                
+                # For now, automatically use first asset of each type
+                assets_selection = {}
+                for asset_type, files in assets_info.items():
+                    if files:
+                        assets_selection[asset_type] = files[0]
+                
+                selected_assets = drive_processor.download_selected_assets(assets_selection)
+        
         # Process projects
-        drive_processor.batch_process_projects(config, output_folder_id)
+        drive_processor.batch_process_projects(config, output_folder_id, selected_assets)
         
         print("\nWorkflow completed!")
         
