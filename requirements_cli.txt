@@ -1,0 +1,27 @@
+# VideoStove CLI Requirements
+# Core dependencies for command-line version without GUI components
+
+# Core video processing
+natsort>=8.4.0
+
+# AI transcription and captioning
+openai-whisper>=20231117
+faster-whisper>=0.10.0
+
+# Google Drive integration (optional)
+google-api-python-client>=2.100.0
+google-auth-httplib2>=0.1.0
+google-auth-oauthlib>=1.0.0
+
+# System dependencies required but not installable via pip:
+# - ffmpeg (install via system package manager)
+# - python3-dev (for some wheel builds)
+
+# Note: GUI dependencies REMOVED for CLI version:
+# - pywebview (GUI framework)
+# - tkinter (usually system package anyway)
+# - Any web-related dependencies
+
+# Optional dependencies for enhanced functionality:
+# torch>=1.9.0  # For GPU acceleration in some AI models
+# torchvision>=0.10.0  # Computer vision utilities
