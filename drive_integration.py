@@ -512,6 +512,45 @@ class DriveVideoStove:
             print(f"Error getting folder modified time: {e}")
             return None
     
+    def _find_assets_folder_in(self, main_folder_id):
+        """Find assets folder within the main folder"""
+        if not main_folder_id:
+            return None
+            
+        try:
+            # Check if the folder_id is already an assets folder (direct assets folder ID case)
+            # Try scanning it directly first
+            results = self.service.files().list(
+                q=f"'{main_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+                fields="files(id, name)"
+            ).execute()
+            
+            subfolder_names = [f['name'].lower() for f in results.get('files', [])]
+            if any(name in ['presets', 'fonts', 'overlays', 'bgmusic'] for name in subfolder_names):
+                # This looks like an assets folder already
+                print(f"📁 Using direct assets folder: {main_folder_id}")
+                self.assets_folder_id = main_folder_id
+                return main_folder_id
+            
+            # Otherwise, look for assets subfolder
+            results = self.service.files().list(
+                q=f"'{main_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+                fields="files(id, name)"
+            ).execute()
+            
+            for folder in results.get('files', []):
+                if folder['name'].lower() in ['assets', 'asset']:
+                    print(f"📁 Found assets folder: {folder['name']} ({folder['id']})")
+                    self.assets_folder_id = folder['id']
+                    return folder['id']
+            
+            print(f"⚠️ No assets folder found in {main_folder_id}")
+            return None
+            
+        except Exception as e:
+            print(f"Error finding assets folder: {e}")
+            return None
+    
     def sync_assets_folder(self, folder_id=None, force_update=False):
         """Download assets only if needed (smart sync)"""
         if not folder_id:
@@ -521,10 +560,17 @@ class DriveVideoStove:
             print("No assets folder to sync")
             return {}
         
+        # If we received a main folder ID, find the assets subfolder
+        assets_folder_id = self._find_assets_folder_in(folder_id)
+        
+        if not assets_folder_id:
+            print("No assets folder found in specified folder")
+            return {}
+        
         print("🔄 Checking asset cache...")
         
-        # Check if cache is valid
-        cache_check = self.check_assets_cache(folder_id)
+        # Check if cache is valid (use assets folder ID for cache check)
+        cache_check = self.check_assets_cache(assets_folder_id)
         
         if not force_update and cache_check.get('cache_valid'):
             print("✅ Asset cache is current, using cached assets")
@@ -534,7 +580,7 @@ class DriveVideoStove:
         
         try:
             # Get fresh asset information from Drive
-            assets_info = self.scan_assets_folder(folder_id)
+            assets_info = self.scan_assets_folder(assets_folder_id)
             
             # Download and cache assets
             cached_assets = {}
@@ -552,9 +598,9 @@ class DriveVideoStove:
                         })
             
             # Update cache metadata
-            drive_modified_time = self._get_folder_modified_time(folder_id)
+            drive_modified_time = self._get_folder_modified_time(assets_folder_id)
             self.asset_cache.update_folder_cache_info(
-                folder_id, 
+                assets_folder_id, 
                 drive_modified_time, 
                 [f"{k}/{f['name']}" for k, v in assets_info.items() for f in v]
             )

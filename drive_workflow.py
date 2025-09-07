@@ -344,14 +344,15 @@ class DriveWorkflowRunner:
     
     def _ensure_assets_available(self, folder_id):
         """Smart asset sync before selection"""
-        if not self.drive_processor.assets_folder_id:
-            self.log("No assets folder found in Drive", force=True)
-            return {}
-        
-        # Sync assets with cache awareness
+        # Sync assets with cache awareness (will find assets folder within main folder)
         available_assets = self.drive_processor.sync_assets_folder(
+            folder_id=folder_id,  # Pass the main folder ID
             force_update=self.force_asset_update
         )
+        
+        if not available_assets:
+            self.log("No assets folder found in Drive", force=True)
+            return {}
         
         if available_assets:
             cache_status = self.drive_processor.asset_cache.get_cache_status()
