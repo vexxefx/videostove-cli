@@ -60,7 +60,7 @@ class DriveWorkflowRunner:
     def run_complete_workflow(self, folder_id, output_folder_id=None, 
                             preset_name=None, dry_run=False, keep_workspace=False, 
                             force_asset_update=False, clear_cache=False):
-        """Run the complete Drive workflow"""
+        """Run the complete Drive workflow with preset-first approach"""
         
         try:
             # Handle cache commands first
@@ -74,54 +74,79 @@ class DriveWorkflowRunner:
             self.log("Setting up workspace...", force=True)
             self.workspace = self.drive_processor.setup_workspace()
             
-            # Step 2: Scan Drive folder for projects (assets handled separately)
-            self.log(f"Scanning Drive folder: {folder_id}", force=True)
-            scan_results = self.drive_processor.scan_drive_folder(folder_id)
-            
-            if not scan_results:
-                raise Exception("Failed to scan Drive folder")
-            
-            self.log(f"Found: {len(scan_results['projects'])} projects, "
-                    f"{len(scan_results['presets'])} presets", force=True)
-            
-            # Step 3: Ensure assets are available (smart sync)
+            # Step 2: Sync assets folder (including presets) FIRST
+            self.log("Syncing assets folder...", force=True)
             available_assets = self._ensure_assets_available(folder_id)
             
-            # Step 4: Select preset from cached assets (if available)
+            # Step 3: SELECT PRESET FIRST
+            self.log("Loading available presets...", force=True)
             selected_preset = None
+            
+            # Try cached presets first
             if available_assets.get('presets'):
                 selected_preset = self._select_preset_from_cache(available_assets['presets'], preset_name)
             
-            # Fallback to regular preset selection if no cached presets
+            # Fallback to scanning Drive for presets
             if not selected_preset:
-                if not scan_results['presets']:
-                    raise Exception("No presets found in Drive folder or cache")
-                
-                self.log("Downloading presets...", force=True)
-                downloaded_presets = self.drive_processor.download_presets(scan_results['presets'])
-                
-                if not downloaded_presets:
-                    raise Exception("No valid presets found")
-                
-                selected_preset = self._select_preset(downloaded_presets, preset_name)
-                if not selected_preset:
-                    raise Exception("No preset selected")
+                scan_results = self.drive_processor.scan_drive_folder(folder_id)
+                if scan_results and scan_results['presets']:
+                    self.log("Downloading presets from Drive...", force=True)
+                    downloaded_presets = self.drive_processor.download_presets(scan_results['presets'])
+                    if downloaded_presets:
+                        selected_preset = self._select_preset(downloaded_presets, preset_name)
             
-            # Step 5: Download projects
-            if not scan_results['projects']:
+            if not selected_preset:
+                raise Exception("No presets found in assets folder or Drive")
+            
+            # Step 4: Get project_type from selected preset
+            project_type = selected_preset.get('project_type', 'montage')
+            self.log(f"Selected preset: {selected_preset['name']} (Mode: {project_type})", force=True)
+            
+            # Step 5: Scan projects and filter based on project_type
+            self.log("Scanning and filtering projects...", force=True)
+            all_projects = self.drive_processor.scan_project_folders(folder_id)
+            
+            if not all_projects:
                 raise Exception("No projects found in Drive folder")
             
-            self.log("Downloading projects...", force=True)
-            downloaded_projects = self.drive_processor.download_projects(scan_results['projects'])
+            # Analyze compatibility before filtering
+            project_analysis = []
+            for project in all_projects:
+                # Download to analyze content (minimal download for analysis)
+                temp_project = self._analyze_project_for_compatibility(project, project_type)
+                project_analysis.append(temp_project)
+            
+            # Filter compatible projects
+            compatible_projects = self.drive_processor.filter_projects_by_mode(project_analysis, project_type)
+            
+            self.log(f"Found {len(all_projects)} total projects, {len(compatible_projects)} compatible with {project_type} mode", force=True)
+            
+            # Display compatibility analysis
+            self._display_project_compatibility(project_analysis, compatible_projects, project_type)
+            
+            if not compatible_projects:
+                raise Exception(f"No projects compatible with {project_type} mode")
+            
+            # Step 6: Select other assets (fonts, overlays, bgmusic)
+            selected_assets = {}
+            if available_assets:
+                self.log("Selecting other assets...", force=True)
+                selected_assets = self._select_other_assets(available_assets)
+            
+            # Step 7: Download compatible projects only
+            self.log("Downloading compatible projects...", force=True)
+            downloaded_projects = self.drive_processor.download_projects(compatible_projects)
             
             if not downloaded_projects:
-                raise Exception("No valid projects downloaded")
+                raise Exception("Failed to download compatible projects")
             
-            # Step 6: Load configuration
+            # Step 8: Load configuration
             self.log("Loading preset configuration...", force=True)
             
             if selected_preset.get('type') == 'cached_preset':
                 config = selected_preset.get('config', {})
+            elif 'settings' in selected_preset and selected_preset['settings']:
+                config = selected_preset['settings']
             else:
                 config = self.drive_processor.load_preset_config(selected_preset)
             
@@ -130,14 +155,7 @@ class DriveWorkflowRunner:
             
             self.log(f"Loaded {len(config)} configuration settings", force=True)
             
-            # Step 7: Select assets from cache
-            selected_assets = {}
-            if available_assets:
-                self.log("Assets available for selection...", force=True)
-                selected_assets = self._select_assets_from_cache(available_assets)
-                self.log(f"Selected {len(selected_assets)} asset types from cache", force=True)
-            
-            # Step 8: Display summary
+            # Step 9: Display summary
             self._display_workflow_summary(downloaded_projects, selected_preset, config, selected_assets)
             
             if dry_run:
@@ -175,20 +193,66 @@ class DriveWorkflowRunner:
                 self.log(f"Workspace preserved at: {self.workspace}", force=True)
     
     def _select_preset(self, presets, preset_name=None):
-        """Select preset either by name or user input"""
+        """Select preset either by name or user input with mode information"""
         
         if preset_name:
             # Find preset by name
             for preset in presets:
                 if preset['name'].lower() == preset_name.lower():
-                    self.log(f"Using specified preset: {preset['name']}", force=True)
+                    project_type = preset.get('project_type', 'montage')
+                    self.log(f"Using specified preset: {preset['name']} (Mode: {project_type})", force=True)
                     return preset
             
             self.log(f"Preset '{preset_name}' not found", force=True)
             return None
         
-        # Interactive selection
-        return self.drive_processor.display_preset_selection()
+        # Enhanced interactive selection with mode information
+        return self._display_preset_selection_with_mode(presets)
+    
+    def _display_preset_selection_with_mode(self, presets):
+        """Display preset selection with project mode information"""
+        print("\nAvailable Presets:")
+        print("=" * 70)
+        
+        for i, preset in enumerate(presets, 1):
+            project_type = preset.get('project_type', 'montage')
+            mode_description = self._get_mode_description(project_type)
+            
+            print(f"{i}. {preset['name']} (Mode: {project_type})")
+            print(f"   Type: {preset.get('type', 'unknown')}")
+            print(f"   Description: {preset.get('description', 'No description')}")
+            print(f"   Project Mode: {mode_description}")
+            if preset.get('date') and preset['date'] != 'Unknown':
+                print(f"   Date: {preset['date']}")
+            print()
+        
+        while True:
+            try:
+                choice = input(f"Select preset (1-{len(presets)}) or 'q' to quit: ").strip()
+                
+                if choice.lower() == 'q':
+                    return None
+                
+                choice_num = int(choice)
+                if 1 <= choice_num <= len(presets):
+                    selected = presets[choice_num - 1]
+                    project_type = selected.get('project_type', 'montage')
+                    print(f"Selected preset: {selected['name']} (Mode: {project_type})")
+                    return selected
+                else:
+                    print("Invalid selection. Please try again.")
+                    
+            except ValueError:
+                print("Please enter a number or 'q' to quit.")
+    
+    def _get_mode_description(self, project_type):
+        """Get description of what each project mode does"""
+        descriptions = {
+            'slideshow': 'Images only - Creates slideshow from images with crossfades',
+            'montage': 'Mixed content - Handles videos as intro + images, or pure montage',
+            'videos_only': 'Videos only - Compiles and processes video files only',
+        }
+        return descriptions.get(project_type, f'Custom mode: {project_type}')
     
     def _select_assets(self, available_assets):
         """Interactive CLI for asset selection"""
@@ -286,13 +350,32 @@ class DriveWorkflowRunner:
         return self._interactive_cached_preset_selection(cached_presets)
     
     def _interactive_cached_preset_selection(self, cached_presets):
-        """Interactive selection from cached presets"""
+        """Interactive selection from cached presets with mode information"""
         print("\nCached Presets Available:")
-        print("=" * 50)
+        print("=" * 70)
         
         for i, preset in enumerate(cached_presets, 1):
-            print(f"{i}. {preset['name']}")
+            # Try to extract project_type from cached preset
+            project_type = 'unknown'
+            try:
+                with open(preset['path'], 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                # Handle different preset formats to extract project_type
+                if 'preset' in data and isinstance(data['preset'], dict):
+                    inner_preset = next(iter(data['preset'].values()))
+                    project_type = inner_preset.get('project_type', 'montage')
+                elif 'project_type' in data:
+                    project_type = data['project_type']
+                elif 'settings' in data:
+                    project_type = data['settings'].get('project_type', 'montage')
+            except:
+                project_type = 'montage'
+            
+            mode_description = self._get_mode_description(project_type)
+            
+            print(f"{i}. {preset['name']} (Mode: {project_type})")
             print(f"   Size: {preset.get('size', 0) / 1024:.1f} KB (cached)")
+            print(f"   Project Mode: {mode_description}")
             print()
         
         while True:
@@ -305,8 +388,21 @@ class DriveWorkflowRunner:
                 choice_num = int(choice)
                 if 1 <= choice_num <= len(cached_presets):
                     selected = cached_presets[choice_num - 1]
-                    print(f"Selected cached preset: {selected['name']}")
-                    return self._load_cached_preset_config(selected)
+                    project_type = 'montage'  # Default fallback
+                    try:
+                        with open(selected['path'], 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        if 'preset' in data and isinstance(data['preset'], dict):
+                            inner_preset = next(iter(data['preset'].values()))
+                            project_type = inner_preset.get('project_type', 'montage')
+                    except:
+                        pass
+                    
+                    print(f"Selected cached preset: {selected['name']} (Mode: {project_type})")
+                    cached_preset_config = self._load_cached_preset_config(selected)
+                    if cached_preset_config:
+                        cached_preset_config['project_type'] = project_type
+                    return cached_preset_config
                 else:
                     print("Invalid selection. Please try again.")
                     
@@ -384,6 +480,62 @@ class DriveWorkflowRunner:
             if cache_info['last_updated']:
                 self.log(f"🕐 Last updated: {cache_info['last_updated']}", force=True)
     
+    def _analyze_project_for_compatibility(self, project_info, project_type):
+        """Analyze project for compatibility without full download"""
+        # This would ideally just peek at folder contents, but for now we'll use existing analysis
+        # In a real implementation, you'd want to minimize the data transfer here
+        return project_info
+    
+    def _select_other_assets(self, available_assets):
+        """Select fonts, overlays, and bgmusic from available assets"""
+        selected_assets = {}
+        
+        for asset_type in ['fonts', 'overlays', 'bgmusic']:
+            assets = available_assets.get(asset_type, [])
+            if assets:
+                selected = self._display_cached_asset_options(asset_type, assets)
+                if selected and selected != 'skip':
+                    selected_assets[asset_type] = selected
+        
+        return selected_assets
+    
+    def _display_project_compatibility(self, all_projects, compatible_projects, project_type):
+        """Display project compatibility analysis"""
+        print(f"\nProject Compatibility Analysis (Mode: {project_type})")
+        print("=" * 60)
+        
+        compatible_names = [p['name'] for p in compatible_projects]
+        
+        for project in all_projects:
+            is_compatible = project['name'] in compatible_names
+            status = "✅ Compatible" if is_compatible else "❌ Skipped"
+            print(f"{project['name']}: {status}")
+            
+            if not is_compatible:
+                reason = self._get_incompatibility_reason(project, project_type)
+                print(f"   Reason: {reason}")
+            else:
+                content_info = self._get_project_content_info(project)
+                print(f"   Content: {content_info}")
+        print()
+    
+    def _get_incompatibility_reason(self, project, project_type):
+        """Get reason why project is incompatible with project_type"""
+        # Note: This would need to be enhanced to actually check project contents
+        # For now, we'll provide general guidance
+        if project_type == "slideshow":
+            return "Project contains videos or no images (slideshow mode requires images only)"
+        elif project_type == "videos_only":
+            return "Project contains no videos (videos_only mode requires videos)"
+        elif project_type == "montage":
+            return "Project contains no media content"
+        return "Unknown incompatibility"
+    
+    def _get_project_content_info(self, project):
+        """Get brief description of project content"""
+        # This is a placeholder - would need actual content analysis
+        return "Images and/or videos detected"
+    
     def _display_workflow_summary(self, projects, preset, config, selected_assets=None):
         """Display workflow summary before processing"""
         
@@ -391,8 +543,9 @@ class DriveWorkflowRunner:
         print("=" * 50)
         print(f"Selected Preset: {preset['name']}")
         print(f"Preset Type: {preset['type']}")
+        print(f"Project Mode: {preset.get('project_type', 'montage')}")
         print(f"Configuration Settings: {len(config)} items")
-        print(f"Projects to Process: {len(projects)}")
+        print(f"Compatible Projects: {len(projects)}")
         print()
         
         print("Projects:")

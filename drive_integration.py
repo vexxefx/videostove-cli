@@ -441,12 +441,32 @@ class DriveVideoStove:
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
+            # Handle nested preset structure from UI exports
+            if 'preset' in data and isinstance(data['preset'], dict):
+                # Extract the inner preset object
+                preset_data = next(iter(data['preset'].values()))
+                preset_name = list(data['preset'].keys())[0]
+                metadata = data.get('metadata', {})
+                
+                return {
+                    'type': 'ui_export',
+                    'name': preset_name,
+                    'date': metadata.get('export_date', 'Unknown'),
+                    'project_type': preset_data.get('project_type', 'montage'),
+                    'description': f"UI exported preset: {preset_name}",
+                    'settings': preset_data,
+                    'preset_count': 1
+                }
+            
             # Check if it's a VideoStove export (full config)
-            if 'metadata' in data and 'settings' in data:
+            elif 'metadata' in data and 'settings' in data:
+                settings = data['settings']
                 return {
                     'type': 'full_config',
                     'name': data['metadata'].get('export_name', 'Unknown Config'),
                     'date': data['metadata'].get('export_date', 'Unknown'),
+                    'project_type': settings.get('project_type', 'montage'),
+                    'settings': settings,
                     'preset_count': 1,
                     'description': f"Full configuration export"
                 }
@@ -455,10 +475,14 @@ class DriveVideoStove:
             elif 'presets' in data:
                 metadata = data.get('metadata', {})
                 preset_count = len(data['presets'])
+                # Get project_type from first preset
+                first_preset = next(iter(data['presets'].values())) if data['presets'] else {}
                 return {
                     'type': 'preset_collection',
                     'name': metadata.get('export_name', f'Preset Collection'),
                     'date': metadata.get('export_date', 'Unknown'),
+                    'project_type': first_preset.get('project_type', 'montage'),
+                    'settings': first_preset,
                     'preset_count': preset_count,
                     'description': f"Collection of {preset_count} presets"
                 }
@@ -469,6 +493,8 @@ class DriveVideoStove:
                     'type': 'single_preset',
                     'name': os.path.basename(file_path).replace('.json', ''),
                     'date': 'Unknown',
+                    'project_type': data.get('project_type', 'montage'),
+                    'settings': data,
                     'preset_count': 1,
                     'description': "Single preset configuration"
                 }
@@ -623,11 +649,20 @@ class DriveVideoStove:
     def load_preset_config(self, preset_info):
         """Load configuration from selected preset"""
         try:
+            # If settings are already extracted in preset_info, use them
+            if 'settings' in preset_info and preset_info['settings']:
+                return preset_info['settings']
+            
+            # Otherwise load from file
             with open(preset_info['local_path'], 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
             # Extract settings based on preset type
-            if preset_info['type'] == 'full_config':
+            if preset_info['type'] == 'ui_export':
+                # Handle UI exported nested structure
+                preset_data = next(iter(data['preset'].values()))
+                return preset_data
+            elif preset_info['type'] == 'full_config':
                 return data.get('settings', {})
             elif preset_info['type'] == 'preset_collection':
                 # For collections, use the first preset or prompt for selection
@@ -643,6 +678,76 @@ class DriveVideoStove:
         except Exception as e:
             print(f"Error loading preset config: {e}")
             return {}
+    
+    def filter_projects_by_mode(self, projects, project_type):
+        """Filter projects based on selected preset's project_type"""
+        if not projects:
+            return []
+        
+        if project_type == "slideshow":
+            # Only process projects with images and no videos
+            return [p for p in projects if p.get('images', []) and not p.get('videos', [])]
+        elif project_type == "videos_only":
+            # Only process projects with videos
+            return [p for p in projects if p.get('videos', [])]
+        elif project_type == "montage":
+            # Process projects with videos OR mixed content
+            return [p for p in projects if p.get('videos', []) or p.get('images', [])]
+        else:
+            # Process all projects for unknown types
+            return projects
+    
+    def scan_project_folders(self, main_folder_id):
+        """Scan for project folders (separate from assets)"""
+        try:
+            results = self.service.files().list(
+                q=f"'{main_folder_id}' in parents and trashed=false",
+                fields="files(id, name, mimeType, modifiedTime)"
+            ).execute()
+            
+            files = results.get('files', [])
+            projects = []
+            
+            for file in files:
+                if file['mimeType'] == 'application/vnd.google-apps.folder':
+                    # Skip assets folder
+                    if file['name'].lower() not in ['assets', 'asset']:
+                        # Check if it's a project folder
+                        if self._is_project_folder(file['id']):
+                            projects.append(file)
+            
+            return projects
+            
+        except Exception as e:
+            print(f"Error scanning project folders: {e}")
+            return []
+    
+    def get_project_compatibility_info(self, project, project_type):
+        """Get compatibility information for a project"""
+        has_images = bool(project.get('images', []))
+        has_videos = bool(project.get('videos', []))
+        
+        if project_type == "slideshow":
+            compatible = has_images and not has_videos
+            reason = None if compatible else (
+                "No images found" if not has_images else "Contains videos (slideshow mode is images-only)"
+            )
+        elif project_type == "videos_only": 
+            compatible = has_videos
+            reason = None if compatible else "No videos found"
+        elif project_type == "montage":
+            compatible = has_images or has_videos
+            reason = None if compatible else "No media content found"
+        else:
+            compatible = True
+            reason = None
+        
+        return {
+            'compatible': compatible,
+            'reason': reason,
+            'has_images': has_images,
+            'has_videos': has_videos
+        }
     
     def batch_process_projects(self, config, output_folder_id, selected_assets=None):
         """Process all downloaded projects using selected configuration"""
