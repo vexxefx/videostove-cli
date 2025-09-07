@@ -17,7 +17,29 @@ from drive_integration import DriveVideoStove
 
 def setup_argument_parser():
     """Setup command line argument parser"""
-    parser = argparse.ArgumentParser(description='VideoStove Google Drive Workflow')
+    parser = argparse.ArgumentParser(
+        description='VideoStove Google Drive Workflow',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Authentication Methods:
+  OAuth: For local development and testing (requires browser)
+  Service Account: For headless deployment (RunPod, servers)
+
+Environment Variables:
+  GOOGLE_CREDENTIALS_PATH: Path to credentials file
+  GOOGLE_CREDENTIALS_BASE64: Base64 encoded credentials JSON
+
+Examples:
+  # OAuth authentication (local)
+  python drive_workflow.py --folder-id <id> --credentials oauth_creds.json
+  
+  # Service Account authentication (headless)
+  python drive_workflow.py --folder-id <id> --credentials service_account.json
+  
+  # Force specific auth method
+  python drive_workflow.py --folder-id <id> --auth-method service --service-account sa.json
+        """
+    )
     
     parser.add_argument('--folder-id', required=True, 
                        help='Google Drive folder ID containing projects and presets')
@@ -25,6 +47,13 @@ def setup_argument_parser():
                        help='Google Drive folder ID for output videos')
     parser.add_argument('--credentials', default='credentials.json',
                        help='Path to Google Drive credentials file')
+    
+    # Authentication options
+    parser.add_argument('--auth-method', choices=['auto', 'oauth', 'service'],
+                       default='auto', help='Authentication method (auto-detects by default)')
+    parser.add_argument('--service-account', 
+                       help='Path to service account JSON file (overrides --credentials)')
+    
     parser.add_argument('--preset-name', 
                        help='Specific preset name to use (skips selection)')
     parser.add_argument('--dry-run', action='store_true',
@@ -587,15 +616,29 @@ def main():
     parser = setup_argument_parser()
     args = parser.parse_args()
     
-    # Check credentials file
-    if not os.path.exists(args.credentials):
-        print(f"Error: Credentials file not found: {args.credentials}")
-        print("Run 'python3 setup_drive_auth.py' first")
+    # Determine credentials path based on arguments
+    credentials_path = args.credentials
+    if args.service_account:
+        credentials_path = args.service_account
+    
+    # Check if credentials exist (skip if using environment variables)
+    if not os.path.exists(credentials_path) and not os.environ.get('GOOGLE_CREDENTIALS_BASE64'):
+        print(f"Error: Credentials file not found: {credentials_path}")
+        print("Options:")
+        print("1. Create credentials.json (OAuth) or service_account.json")
+        print("2. Set GOOGLE_CREDENTIALS_PATH environment variable")
+        print("3. Set GOOGLE_CREDENTIALS_BASE64 environment variable")
+        print("4. Run 'python3 setup_drive_auth.py' for OAuth setup")
         return 1
     
     try:
-        # Initialize workflow runner
-        runner = DriveWorkflowRunner(args.credentials, args.verbose)
+        # Initialize workflow runner with credentials path
+        runner = DriveWorkflowRunner(credentials_path, args.verbose)
+        
+        # Validate authentication before proceeding
+        if not runner.drive_processor.service:
+            print("ERROR: Authentication failed")
+            return 1
         
         # Run workflow
         success = runner.run_complete_workflow(

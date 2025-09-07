@@ -5,11 +5,13 @@ import os
 import json
 import tempfile
 import shutil
+import base64
 from pathlib import Path
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google.oauth2 import service_account
 from google_auth_oauthlib.flow import InstalledAppFlow
 import datetime
 from asset_cache import AssetCache
@@ -17,7 +19,16 @@ from asset_cache import AssetCache
 class DriveVideoStove:
     """Google Drive integrated VideoStove processor"""
     
-    def __init__(self, credentials_path='credentials.json'):
+    def __init__(self, credentials_path=None):
+        # Support environment variables for RunPod deployment
+        if not credentials_path:
+            credentials_path = os.environ.get('GOOGLE_CREDENTIALS_PATH', 'credentials.json')
+        
+        # Support base64 encoded credentials in environment
+        encoded_creds = os.environ.get('GOOGLE_CREDENTIALS_BASE64')
+        if encoded_creds:
+            credentials_path = self._decode_credentials(encoded_creds)
+        
         self.service = self._authenticate(credentials_path)
         self.work_dir = None
         self.downloaded_presets = []
@@ -27,33 +38,163 @@ class DriveVideoStove:
         self.asset_cache = AssetCache()
         self.assets_folder_id = None
         
+    def _decode_credentials(self, encoded_creds):
+        """Decode base64 encoded credentials and save to temp file"""
+        try:
+            decoded = base64.b64decode(encoded_creds)
+            temp_creds = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+            temp_creds.write(decoded.decode('utf-8'))
+            temp_creds.close()
+            print("Using base64 encoded credentials from environment")
+            return temp_creds.name
+        except Exception as e:
+            print(f"ERROR: Failed to decode credentials: {e}")
+            return None
+    
     def _authenticate(self, credentials_path):
-        """Authenticate with Google Drive API"""
+        """Authenticate with Google Drive API supporting both OAuth and Service Account"""
         SCOPES = ['https://www.googleapis.com/auth/drive']
+        
+        # Detect credential type by examining the file content
+        try:
+            with open(credentials_path, 'r') as f:
+                creds_data = json.load(f)
+        except FileNotFoundError:
+            print(f"ERROR: {credentials_path} not found!")
+            return None
+        except json.JSONDecodeError:
+            print(f"ERROR: Invalid JSON in {credentials_path}")
+            return None
+        
+        # Service Account authentication (for headless environments)
+        if creds_data.get('type') == 'service_account':
+            print("Using Service Account authentication (headless mode)")
+            return self._authenticate_service_account(credentials_path, SCOPES)
+        
+        # OAuth authentication (for interactive environments)
+        elif 'client_id' in creds_data:
+            print("Using OAuth authentication (interactive mode)")
+            return self._authenticate_oauth(credentials_path, SCOPES)
+        
+        else:
+            print("ERROR: Unrecognized credential format")
+            return None
+    
+    def _authenticate_service_account(self, credentials_path, scopes):
+        """Service account authentication for headless environments"""
+        try:
+            credentials = service_account.Credentials.from_service_account_file(
+                credentials_path, scopes=scopes
+            )
+            
+            service = build('drive', 'v3', credentials=credentials)
+            
+            # Test the connection
+            service.about().get(fields="user").execute()
+            print("Service account authentication successful")
+            return service
+            
+        except Exception as e:
+            print(f"Service account authentication failed: {e}")
+            return None
+    
+    def _authenticate_oauth(self, credentials_path, scopes):
+        """OAuth authentication for interactive environments"""
         creds = None
         
         # Check for existing token
         if os.path.exists('token.json'):
-            creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+            try:
+                creds = Credentials.from_authorized_user_file('token.json', scopes)
+            except Exception as e:
+                print(f"Warning: Could not load existing token: {e}")
         
         # Refresh or create new credentials
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
-                if not os.path.exists(credentials_path):
-                    print(f"ERROR: {credentials_path} not found!")
-                    print("Download credentials from Google Cloud Console")
+                try:
+                    creds.refresh(Request())
+                    print("OAuth token refreshed successfully")
+                except Exception as e:
+                    print(f"Token refresh failed: {e}")
+                    creds = None
+            
+            if not creds:
+                # Check if running in an interactive environment
+                if self._is_interactive_environment():
+                    creds = self._interactive_oauth_flow(credentials_path, scopes)
+                else:
+                    print("ERROR: OAuth requires interactive environment")
+                    print("For headless deployment, use Service Account credentials")
                     return None
-                
-                flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
-                creds = flow.run_local_server(port=0)
             
             # Save credentials for next run
-            with open('token.json', 'w') as token:
-                token.write(creds.to_json())
+            if creds:
+                try:
+                    with open('token.json', 'w') as token:
+                        token.write(creds.to_json())
+                    print("OAuth credentials saved")
+                except Exception as e:
+                    print(f"Warning: Could not save token: {e}")
         
-        return build('drive', 'v3', credentials=creds)
+        if creds:
+            return build('drive', 'v3', credentials=creds)
+        return None
+    
+    def _is_interactive_environment(self):
+        """Detect if running in an interactive environment"""
+        try:
+            # Check for Colab
+            import google.colab
+            return True
+        except ImportError:
+            pass
+        
+        # Check if we have a display
+        import os
+        return bool(os.environ.get('DISPLAY'))
+    
+    def _interactive_oauth_flow(self, credentials_path, scopes):
+        """Handle OAuth flow for interactive environments"""
+        try:
+            flow = InstalledAppFlow.from_client_secrets_file(credentials_path, scopes)
+            
+            # Try local server first (works in most environments)
+            try:
+                creds = flow.run_local_server(port=0, open_browser=False)
+                return creds
+            except Exception:
+                # Fallback to manual flow
+                print("Local server authentication failed, using manual flow")
+                return self._manual_oauth_flow(flow)
+                
+        except Exception as e:
+            print(f"OAuth flow failed: {e}")
+            return None
+    
+    def _manual_oauth_flow(self, flow):
+        """Manual OAuth flow for environments without local server"""
+        flow.redirect_uri = 'urn:ietf:wg:oauth:2.0:oob'
+        
+        auth_url, _ = flow.authorization_url(prompt='consent')
+        
+        print("\nManual OAuth Authentication Required:")
+        print("=" * 50)
+        print(f"1. Visit this URL: {auth_url}")
+        print("2. Authorize the application")
+        print("3. Copy the authorization code")
+        print("4. Paste it below")
+        print("=" * 50)
+        
+        auth_code = input("Enter authorization code: ").strip()
+        
+        try:
+            flow.fetch_token(code=auth_code)
+            print("Manual OAuth authentication successful")
+            return flow.credentials
+        except Exception as e:
+            print(f"Manual OAuth failed: {e}")
+            return None
     
     def setup_workspace(self):
         """Create temporary workspace for processing (projects only, assets are cached)"""
