@@ -307,27 +307,28 @@ class DriveVideoStove:
             return False
     
     def scan_assets_folder(self, assets_folder_id):
-        """Scan assets folder and categorize available assets"""
+        """Scan assets folder and categorize available resources including presets"""
         print(f"Scanning assets folder: {assets_folder_id}")
         
         try:
             assets_info = {
+                'presets': [],
                 'fonts': [],
                 'overlays': [],
                 'bgmusic': []
             }
             
-            # Get subfolder contents
-            fonts = self._get_subfolder_contents(assets_folder_id, 'fonts')
-            overlays = self._get_subfolder_contents(assets_folder_id, 'overlays')
-            bgmusic = self._get_subfolder_contents(assets_folder_id, 'bgmusic')
+            # Get subfolder contents for ALL asset types including presets
+            for asset_type in ['presets', 'fonts', 'overlays', 'bgmusic']:
+                assets_info[asset_type] = self._get_subfolder_contents(assets_folder_id, asset_type)
             
-            assets_info['fonts'] = fonts
-            assets_info['overlays'] = overlays
-            assets_info['bgmusic'] = bgmusic
+            # Add logging to show what was found
+            preset_count = len(assets_info['presets'])
+            font_count = len(assets_info['fonts'])
+            overlay_count = len(assets_info['overlays'])
+            bgmusic_count = len(assets_info['bgmusic'])
             
-            total_assets = len(fonts) + len(overlays) + len(bgmusic)
-            print(f"Found assets: {len(fonts)} fonts, {len(overlays)} overlays, {len(bgmusic)} bgmusic files")
+            print(f"Found assets: {preset_count} presets, {font_count} fonts, {overlay_count} overlays, {bgmusic_count} bgmusic files")
             
             self.available_assets = assets_info
             return assets_info
@@ -354,12 +355,24 @@ class DriveVideoStove:
             # Get files in subfolder
             results = self.service.files().list(
                 q=f"'{subfolder_id}' in parents and trashed=false",
-                fields="files(id, name, mimeType, size)"
+                fields="files(id, name, mimeType, size, modifiedTime)"
             ).execute()
             
             files = results.get('files', [])
             
-            # Filter by asset type
+            # For presets, filter for JSON files and analyze them
+            if subfolder_name == 'presets':
+                valid_presets = []
+                for file in files:
+                    if file['mimeType'] != 'application/vnd.google-apps.folder' and file['name'].endswith('.json'):
+                        # Add preset analysis
+                        preset_info = self._analyze_preset_file_from_drive(file['id'], file['name'])
+                        if preset_info:
+                            preset_info['drive_file'] = file
+                            valid_presets.append(preset_info)
+                return valid_presets
+            
+            # For other asset types, return file info directly
             valid_files = []
             for file in files:
                 if file['mimeType'] != 'application/vnd.google-apps.folder':
@@ -373,6 +386,23 @@ class DriveVideoStove:
             print(f"Error getting {subfolder_name} contents: {e}")
             return []
     
+    def _analyze_preset_file_from_drive(self, file_id, filename):
+        """Analyze preset file directly from Drive without downloading to disk"""
+        try:
+            # Download file content to memory
+            request = self.service.files().get_media(fileId=file_id)
+            content = request.execute()
+            
+            # Parse JSON
+            data = json.loads(content.decode('utf-8'))
+            
+            # Use existing analysis logic from _analyze_preset_file
+            return self._analyze_preset_file(data, filename)
+            
+        except Exception as e:
+            print(f"Error analyzing preset file {filename}: {e}")
+            return None
+    
     def _is_valid_asset_file(self, filename, asset_type):
         """Check if file is a valid asset for the given type"""
         filename_lower = filename.lower()
@@ -383,6 +413,8 @@ class DriveVideoStove:
             return filename_lower.endswith(('.mp4', '.mov', '.avi', '.webm', '.mkv'))
         elif asset_type == 'bgmusic':
             return filename_lower.endswith(('.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg'))
+        elif asset_type == 'presets':
+            return filename_lower.endswith('.json')
         
         return False
     
