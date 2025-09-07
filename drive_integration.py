@@ -396,9 +396,26 @@ class DriveVideoStove:
             # Parse JSON
             data = json.loads(content.decode('utf-8'))
             
-            # Use existing analysis logic from _analyze_preset_file
-            return self._analyze_preset_file(data, filename)
-            
+            # Analyze preset data directly (no method call)
+            if 'preset' in data and isinstance(data['preset'], dict):
+                # Extract the inner preset object
+                preset_data = next(iter(data['preset'].values()))
+                preset_name = list(data['preset'].keys())[0]
+                metadata = data.get('metadata', {})
+                
+                return {
+                    'type': 'ui_export',
+                    'name': preset_name,
+                    'date': metadata.get('export_date', 'Unknown'),
+                    'project_type': preset_data.get('project_type', 'montage'),
+                    'description': f"UI exported preset: {preset_name}",
+                    'settings': preset_data,
+                    'file_id': file_id
+                }
+            else:
+                print(f"Invalid preset format in {filename}")
+                return None
+                
         except Exception as e:
             print(f"Error analyzing preset file {filename}: {e}")
             return None
