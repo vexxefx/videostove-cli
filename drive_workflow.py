@@ -21,6 +21,10 @@ def setup_argument_parser():
         description='VideoStove Google Drive Workflow',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Assets-First Workflow (Recommended):
+  Provide the assets folder ID directly for reliable preset detection.
+  The assets folder should contain: presets/, fonts/, overlays/, bgmusic/
+
 Authentication Methods:
   OAuth: For local development and testing (requires browser)
   Service Account: For headless deployment (RunPod, servers)
@@ -30,19 +34,19 @@ Environment Variables:
   GOOGLE_CREDENTIALS_BASE64: Base64 encoded credentials JSON
 
 Examples:
-  # OAuth authentication (local)
-  python drive_workflow.py --folder-id <id> --credentials oauth_creds.json
+  # Use assets folder ID directly (RECOMMENDED)
+  python drive_workflow.py --folder-id 1ordCteHj7H0vSmPvTaClR9juAHIwDWPS --preset twovet
+  
+  # With custom output folder
+  python drive_workflow.py --folder-id 1ordCteHj7H0vSmPvTaClR9juAHIwDWPS --output-folder-id 1aELjJPrOf2u6EKy18WQY2lc_aSekXXhQ
   
   # Service Account authentication (headless)
-  python drive_workflow.py --folder-id <id> --credentials service_account.json
-  
-  # Force specific auth method
-  python drive_workflow.py --folder-id <id> --auth-method service --service-account sa.json
+  python drive_workflow.py --folder-id 1ordCteHj7H0vSmPvTaClR9juAHIwDWPS --credentials service_account.json --preset science
         """
     )
     
     parser.add_argument('--folder-id', required=True, 
-                       help='Google Drive folder ID containing projects and presets')
+                       help='Assets folder ID (contains presets/, fonts/, overlays/, bgmusic/)')
     parser.add_argument('--output-folder-id', 
                        help='Google Drive folder ID for output videos')
     parser.add_argument('--credentials', default='credentials.json',
@@ -89,7 +93,17 @@ class DriveWorkflowRunner:
     def run_complete_workflow(self, folder_id, output_folder_id=None, 
                             preset_name=None, dry_run=False, keep_workspace=False, 
                             force_asset_update=False, clear_cache=False):
-        """Run the complete Drive workflow with preset-first approach"""
+        """Run complete workflow using assets-first approach
+        
+        Args:
+            folder_id: Assets folder ID (contains presets/, fonts/, overlays/, bgmusic/)
+            output_folder_id: Optional folder for outputs (defaults to parent of assets folder)
+            preset_name: Specific preset to use
+            dry_run: Test mode without processing
+            keep_workspace: Keep temp files for debugging
+            force_asset_update: Force re-download assets
+            clear_cache: Clear asset cache first
+        """
         
         try:
             # Handle cache commands first
@@ -103,41 +117,54 @@ class DriveWorkflowRunner:
             self.log("Setting up workspace...", force=True)
             self.workspace = self.drive_processor.setup_workspace()
             
-            # Step 2: Sync assets folder (including presets) FIRST
-            self.log("Syncing assets folder...", force=True)
-            available_assets = self._ensure_assets_available(folder_id)
+            # Step 2: Set assets folder ID directly (assets-first approach)
+            self.log(f"Using assets folder directly: {folder_id}", force=True)
+            self.drive_processor.assets_folder_id = folder_id
             
-            # Step 3: SELECT PRESET FIRST
-            self.log("Loading available presets...", force=True)
-            selected_preset = None
+            # Step 3: Sync assets (this should work since we're using assets folder directly)
+            self.log("Syncing assets...", force=True)
+            available_assets = self.drive_processor.sync_assets_folder(
+                folder_id=folder_id,
+                force_update=self.force_asset_update
+            )
             
-            # PRIORITY: Use synced assets folder presets (this works)
-            if available_assets.get('presets'):
-                selected_preset = self._select_preset_from_cache(available_assets['presets'], preset_name)
+            # Step 4: Find and select preset
+            self.log("Loading presets...", force=True)
+            available_presets = available_assets.get('presets', [])
             
-            # Fallback to scanning Drive folder directly for presets (backup method)
+            if not available_presets:
+                raise Exception("No presets found in assets folder")
+            
+            self.log(f"Found {len(available_presets)} presets", force=True)
+            for preset in available_presets:
+                self.log(f"  - {preset.get('name', 'Unknown')}", force=True)
+            
+            # Select preset
+            if preset_name:
+                selected_preset = None
+                for preset in available_presets:
+                    if preset.get('name', '').lower() == preset_name.lower():
+                        selected_preset = preset
+                        break
+                
+                if not selected_preset:
+                    raise Exception(f"Preset '{preset_name}' not found")
+            else:
+                # Interactive selection
+                selected_preset = self._select_preset(available_presets, preset_name)
+            
             if not selected_preset:
-                self.log("Falling back to Drive folder scan for presets...", force=True)
-                scan_results = self.drive_processor.scan_drive_folder(folder_id)
-                if scan_results and scan_results['presets']:
-                    self.log("Downloading presets from Drive...", force=True)
-                    downloaded_presets = self.drive_processor.download_presets(scan_results['presets'])
-                    if downloaded_presets:
-                        selected_preset = self._select_preset(downloaded_presets, preset_name)
+                raise Exception("No preset selected")
             
-            if not selected_preset:
-                raise Exception("No presets found in assets folder or Drive")
-            
-            # Step 4: Get project_type from selected preset
             project_type = selected_preset.get('project_type', 'montage')
             self.log(f"Selected preset: {selected_preset['name']} (Mode: {project_type})", force=True)
             
-            # Step 5: Scan projects and filter based on project_type
-            self.log("Scanning and filtering projects...", force=True)
-            all_projects = self.drive_processor.scan_project_folders(folder_id)
+            # Step 5: Find projects from parent folder (assets-first approach)
+            self.log("Finding projects from parent folder...", force=True)
+            all_projects = self.drive_processor.find_projects_from_assets_parent(folder_id)
             
             if not all_projects:
-                raise Exception("No projects found in Drive folder")
+                raise Exception("No projects found in parent folder")
             
             # Analyze compatibility before filtering
             project_analysis = []
@@ -185,7 +212,16 @@ class DriveWorkflowRunner:
             
             self.log(f"Loaded {len(config)} configuration settings", force=True)
             
-            # Step 9: Display summary
+            # Step 9: Determine output folder
+            if not output_folder_id:
+                # Use parent of assets folder as default output location
+                output_folder_id = self.drive_processor.find_parent_folder(folder_id)
+                if output_folder_id:
+                    self.log(f"Using parent folder for outputs: {output_folder_id}", force=True)
+                else:
+                    self.log("Warning: No output folder specified and no parent folder found", force=True)
+            
+            # Step 10: Display summary
             self._display_workflow_summary(downloaded_projects, selected_preset, config, selected_assets)
             
             if dry_run:

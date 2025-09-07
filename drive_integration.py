@@ -323,6 +323,49 @@ class DriveVideoStove:
             # Fallback: check if it's a JSON file by name
             return False
     
+    def find_parent_folder(self, folder_id):
+        """Find parent folder of given folder ID"""
+        try:
+            folder_info = self.service.files().get(
+                fileId=folder_id, 
+                fields="parents,name"
+            ).execute()
+            
+            parents = folder_info.get('parents', [])
+            if parents:
+                parent_id = parents[0]
+                parent_info = self.service.files().get(
+                    fileId=parent_id,
+                    fields="name,id"
+                ).execute()
+                
+                print(f"Found parent folder: {parent_info['name']} ({parent_id})")
+                return parent_id
+            else:
+                print("No parent folder found (root level)")
+                return None
+                
+        except Exception as e:
+            print(f"Error finding parent folder: {e}")
+            return None
+    
+    def find_projects_from_assets_parent(self, assets_folder_id):
+        """Find project folders in the parent of the assets folder"""
+        try:
+            # Find parent folder
+            parent_folder_id = self.find_parent_folder(assets_folder_id)
+            if not parent_folder_id:
+                print("Cannot find projects - no parent folder")
+                return []
+            
+            # Scan parent folder for project folders
+            print(f"Scanning parent folder for projects: {parent_folder_id}")
+            return self.scan_project_folders(parent_folder_id)
+            
+        except Exception as e:
+            print(f"Error finding projects from assets parent: {e}")
+            return []
+    
     def scan_assets_folder(self, assets_folder_id):
         """Scan assets folder and categorize available resources including presets"""
         print(f"Scanning assets folder: {assets_folder_id}")
