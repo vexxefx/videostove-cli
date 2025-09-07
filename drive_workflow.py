@@ -111,12 +111,13 @@ class DriveWorkflowRunner:
             self.log("Loading available presets...", force=True)
             selected_preset = None
             
-            # Try cached presets first
+            # PRIORITY: Use synced assets folder presets (this works)
             if available_assets.get('presets'):
                 selected_preset = self._select_preset_from_cache(available_assets['presets'], preset_name)
             
-            # Fallback to scanning Drive for presets
+            # Fallback to scanning Drive folder directly for presets (backup method)
             if not selected_preset:
+                self.log("Falling back to Drive folder scan for presets...", force=True)
                 scan_results = self.drive_processor.scan_drive_folder(folder_id)
                 if scan_results and scan_results['presets']:
                     self.log("Downloading presets from Drive...", force=True)

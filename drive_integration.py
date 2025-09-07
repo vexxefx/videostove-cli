@@ -241,8 +241,12 @@ class DriveVideoStove:
                         self.assets_folder_id = file['id']
                 elif file['name'].endswith('.json'):
                     # Check if it's a preset file
+                    print(f"Checking JSON file for preset: {file['name']}")
                     if self._is_preset_file(file['id']):
                         presets.append(file)
+                        print(f"✅ Valid preset found: {file['name']}")
+                    else:
+                        print(f"❌ Not a preset: {file['name']}")
                 else:
                     other_files.append(file)
             
@@ -296,14 +300,27 @@ class DriveVideoStove:
     def _is_preset_file(self, file_id):
         """Check if file is a VideoStove preset"""
         try:
-            # Download first 1KB to check structure
+            # Download file content
             request = self.service.files().get_media(fileId=file_id)
-            content = request.execute()[:1024].decode('utf-8', errors='ignore')
+            content = request.execute()
             
-            # Quick check for VideoStove preset structure
-            return '"videostove" in content.lower() or "presets" in content.lower()'
+            # Parse as JSON and check structure
+            data = json.loads(content.decode('utf-8'))
             
-        except Exception:
+            # Check for valid preset structures
+            if 'preset' in data and isinstance(data['preset'], dict):
+                return True  # UI export format
+            elif 'metadata' in data and 'settings' in data:
+                return True  # Full config export format
+            elif 'presets' in data:
+                return True  # Preset collection format
+            elif 'image_duration' in data or 'main_audio_vol' in data:
+                return True  # Single preset format
+            
+            return False
+            
+        except Exception as e:
+            # Fallback: check if it's a JSON file by name
             return False
     
     def scan_assets_folder(self, assets_folder_id):
